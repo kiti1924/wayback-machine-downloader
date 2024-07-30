@@ -1,5 +1,4 @@
 # encoding: UTF-8
-
 require 'thread'
 require 'net/http'
 require 'open-uri'
@@ -9,17 +8,15 @@ require 'json'
 require_relative 'wayback_machine_downloader/tidy_bytes'
 require_relative 'wayback_machine_downloader/to_regex'
 require_relative 'wayback_machine_downloader/archive_api'
-
 class WaybackMachineDownloader
 
   include ArchiveAPI
 
-  VERSION = "2.3.1"
+  VERSION = "2.3.2"
 
   attr_accessor :base_url, :exact_url, :directory, :all_timestamps,
     :from_timestamp, :to_timestamp, :only_filter, :exclude_filter, 
     :all, :maximum_pages, :threads_count
-
   def initialize params
     @base_url = params[:base_url]
     @exact_url = params[:exact_url]
@@ -33,7 +30,6 @@ class WaybackMachineDownloader
     @maximum_pages = params[:maximum_pages] ? params[:maximum_pages].to_i : 100
     @threads_count = params[:threads_count].to_i
   end
-
   def backup_name
     if @base_url.include? '//'
       @base_url.split('/')[2]
@@ -41,7 +37,6 @@ class WaybackMachineDownloader
       @base_url
     end
   end
-
   def backup_path
     if @directory
       if @directory[-1] == '/'
@@ -53,7 +48,6 @@ class WaybackMachineDownloader
       'websites/' + backup_name + '/'
     end
   end
-
   def match_only_filter file_url
     if @only_filter
       only_filter_regex = @only_filter.to_regex
@@ -66,7 +60,6 @@ class WaybackMachineDownloader
       true
     end
   end
-
   def match_exclude_filter file_url
     if @exclude_filter
       exclude_filter_regex = @exclude_filter.to_regex
@@ -79,27 +72,29 @@ class WaybackMachineDownloader
       false
     end
   end
-
   def get_all_snapshots_to_consider
     # Note: Passing a page index parameter allow us to get more snapshots,
     # but from a less fresh index
+    http = Net::HTTP.new("web.archive.org", 443)
+    http.use_ssl = true
+    http.start()
     print "Getting snapshot pages"
     snapshot_list_to_consider = []
-    snapshot_list_to_consider += get_raw_list_from_api(@base_url, nil)
+    snapshot_list_to_consider += get_raw_list_from_api(@base_url, nil, http)
     print "."
     unless @exact_url
       @maximum_pages.times do |page_index|
-        snapshot_list = get_raw_list_from_api(@base_url + '/*', page_index)
+        snapshot_list = get_raw_list_from_api(@base_url + '/*', page_index, http)
         break if snapshot_list.empty?
         snapshot_list_to_consider += snapshot_list
         print "."
       end
     end
+    http.finish()
     puts " found #{snapshot_list_to_consider.length} snaphots to consider."
     puts
     snapshot_list_to_consider
   end
-
   def get_file_list_curated
     file_list_curated = Hash.new
     get_all_snapshots_to_consider.each do |file_timestamp, file_url|
@@ -125,7 +120,6 @@ class WaybackMachineDownloader
     end
     file_list_curated
   end
-
   def get_file_list_all_timestamps
     file_list_curated = Hash.new
     get_all_snapshots_to_consider.each do |file_timestamp, file_url|
@@ -151,8 +145,6 @@ class WaybackMachineDownloader
     puts "file_list_curated: " + file_list_curated.count.to_s
     file_list_curated
   end
-
-
   def get_file_list_by_timestamp
     if @all_timestamps
       file_list_curated = get_file_list_all_timestamps
@@ -169,7 +161,6 @@ class WaybackMachineDownloader
       end
     end
   end
-
   def list_files
     # retrieval produces its own output
     @orig_stdout = $stdout
@@ -183,12 +174,10 @@ class WaybackMachineDownloader
     puts files[-1].to_json
     puts "]"
   end
-
   def download_files
     start_time = Time.now
     puts "Downloading #{@base_url} to #{backup_path} from Wayback Machine archives."
     puts
-
     if file_list_by_timestamp.count == 0
       puts "No files to download."
       puts "Possible reasons:"
@@ -201,16 +190,19 @@ class WaybackMachineDownloader
     end
  
     puts "#{file_list_by_timestamp.count} files to download:"
-
     threads = []
     @processed_file_count = 0
     @threads_count = 1 unless @threads_count != 0
     @threads_count.times do
+      http = Net::HTTP.new("web.archive.org", 443)
+      http.use_ssl = true
+      http.start()
       threads << Thread.new do
         until file_queue.empty?
           file_remote_info = file_queue.pop(true) rescue nil
-          download_file(file_remote_info) if file_remote_info
+          download_file(file_remote_info, http) if file_remote_info
         end
+        http.finish()
       end
     end
 
@@ -219,7 +211,6 @@ class WaybackMachineDownloader
     puts
     puts "Download completed in #{(end_time - start_time).round(2)}s, saved in #{backup_path} (#{file_list_by_timestamp.size} files)"
   end
-
   def structure_dir_path dir_path
     begin
       FileUtils::mkdir_p dir_path unless File.exist? dir_path
@@ -243,7 +234,7 @@ class WaybackMachineDownloader
     end
   end
 
-  def download_file file_remote_info
+  def download_file (file_remote_info, http)
     current_encoding = "".encoding
     file_url = file_remote_info[:file_url].encode(current_encoding)
     file_id = file_remote_info[:file_id]
@@ -268,8 +259,8 @@ class WaybackMachineDownloader
         structure_dir_path dir_path
         open(file_path, "wb") do |file|
           begin
-            URI("https://web.archive.org/web/#{file_timestamp}id_/#{file_url}").open("Accept-Encoding" => "plain") do |uri|
-              file.write(uri.read)
+            http.get(URI("https://web.archive.org/web/#{file_timestamp}id_/#{file_url}")) do |body|
+              file.write(body)
             end
           rescue OpenURI::HTTPError => e
             puts "#{file_url} # #{e}"
@@ -300,15 +291,12 @@ class WaybackMachineDownloader
       end
     end
   end
-
   def file_queue
     @file_queue ||= file_list_by_timestamp.each_with_object(Queue.new) { |file_info, q| q << file_info }
   end
-
   def file_list_by_timestamp
     @file_list_by_timestamp ||= get_file_list_by_timestamp
   end
-
   def semaphore
     @semaphore ||= Mutex.new
   end
